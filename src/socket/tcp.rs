@@ -1478,6 +1478,25 @@ impl<'a> Socket<'a> {
         (ip_reply_repr, reply_repr)
     }
 
+    fn ack_seq_number(&self) -> TcpSeqNumber {
+        match self.state {
+            State::Established
+            | State::FinWait1
+            | State::FinWait2
+            | State::Closing
+            | State::TimeWait
+            | State::CloseWait
+            | State::LastAck
+                if self.remote_win_len == 0 && !self.tx_buffer.is_empty() =>
+            {
+                // A retracted zero window may not accept the frontier of outstanding data.
+                // A FIN alone can be accepted at a zero window, so keep its frontier.
+                self.local_seq_no
+            }
+            _ => self.local_next_seq,
+        }
+    }
+
     fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
         reply_repr.timestamp = repr
@@ -1488,7 +1507,7 @@ impl<'a> Socket<'a> {
         // [...] an empty acknowledgment segment containing the current send-sequence number
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
-        reply_repr.seq_number = self.local_next_seq;
+        reply_repr.seq_number = self.ack_seq_number();
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
         self.remote_last_ack = reply_repr.ack_number;
 
@@ -2656,7 +2675,10 @@ impl<'a> Socket<'a> {
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
-                    let size = effective_mss.min(self.tx_buffer.len());
+                    // Retransmission must not extend the frontier with previously unsent data.
+                    let size = effective_mss
+                        .min(self.tx_buffer.len())
+                        .min(self.local_next_seq - self.local_seq_no);
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
@@ -2762,9 +2784,9 @@ impl<'a> Socket<'a> {
             State::FinWait2 | State::TimeWait => {}
         }
 
-        // Data-free segments use the send frontier, not the retransmission cursor.
-        if repr.segment_len() == 0 {
-            repr.seq_number = self.local_next_seq;
+        // ACKs must not use the rewound retransmission cursor. Keep RST sequencing unchanged.
+        if repr.segment_len() == 0 && repr.control != TcpControl::Rst {
+            repr.seq_number = self.ack_seq_number();
         }
 
         // There might be more than one reason to send a packet. E.g. the keep-alive timer
@@ -6715,6 +6737,543 @@ mod test {
         }]);
     }
 
+    #[test]
+    fn test_ack_after_peer_retracts_window_to_zero() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 4,
+                ..SEND_TEMPL
+            }
+        );
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"abcd",
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Rounding retracted the peer's edge by one byte. Its zero window now
+        // accepts only RCV.NXT, not the frontier of the data we already sent.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 4),
+                window_len: 0,
+                payload: b"x",
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 4,
+                ack_number: Some(REMOTE_SEQ + 2),
+                window_len: 63,
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Corrective ACKs must use the same sequence as scheduled ACKs.
+        let reply = send(
+            &mut s,
+            Instant::from_millis(1),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 4),
+                window_len: 0,
+                payload: b"x",
+                ..SEND_TEMPL
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.seq_number, LOCAL_SEQ + 4);
+        assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 2));
+        assert_eq!(s.local_next_seq, LOCAL_SEQ + 5);
+    }
+
+    #[test]
+    fn test_simultaneous_close_at_zero_window() {
+        let mut peers = [socket_established(), socket_established()];
+        for s in &mut peers {
+            s.set_congestion_control(CongestionControl::None);
+            s.set_ack_delay(None);
+            s.remote_win_len = 64;
+            s.send_slice(&[b'x'; 64]).unwrap();
+        }
+
+        // Exchange data, zero-window ACKs, simultaneous FINs, then the FIN ACKs.
+        for phase in 0..4 {
+            let now = Instant::from_millis(phase);
+            let mut packets = Vec::new();
+            for s in &mut peers {
+                recv(s, now, |repr| {
+                    let repr = repr.unwrap();
+                    if phase == 0 {
+                        assert_eq!(repr.payload.len(), 64);
+                    } else {
+                        assert!(repr.payload.is_empty());
+                        assert_eq!(repr.window_len, 0);
+                        if phase == 2 {
+                            assert_eq!(repr.control, TcpControl::Fin);
+                        } else {
+                            assert_eq!(repr.control, TcpControl::None);
+                        }
+                        if phase == 3 {
+                            assert_eq!(repr.seq_number, LOCAL_SEQ + 66);
+                        }
+                    }
+                    packets.push((
+                        TcpRepr {
+                            payload: &[],
+                            ..repr
+                        },
+                        repr.payload.to_vec(),
+                    ));
+                });
+            }
+            for (i, (repr, payload)) in packets.iter().enumerate() {
+                let incoming = TcpRepr {
+                    control: repr.control,
+                    seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                    ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                    window_len: repr.window_len,
+                    payload,
+                    ..SEND_TEMPL
+                };
+                assert!(send(&mut peers[1 - i], now, &incoming).is_none());
+            }
+            if phase == 1 {
+                for s in &mut peers {
+                    assert_eq!(s.send_queue(), 0);
+                    assert_eq!(s.remote_win_len, 0);
+                    s.close();
+                }
+            } else if phase == 2 {
+                for s in &peers {
+                    assert_eq!(s.state, State::Closing);
+                }
+            }
+        }
+        for s in &peers {
+            assert_eq!(s.state, State::TimeWait);
+        }
+    }
+
+    #[test]
+    fn test_reset_after_filling_peer_window() {
+        for timeout in [false, true] {
+            for peer_reads in [false, true] {
+                for (fin_with_data, fin_after_ack) in [(false, false), (true, false), (false, true)]
+                {
+                    let mut s = socket_established_with_buffer_sizes(4096, 64);
+                    s.set_congestion_control(CongestionControl::None);
+                    s.remote_mss = 1024;
+                    s.remote_win_len = 2048;
+                    let mut peer = socket_established_with_buffer_sizes(64, 2048);
+                    peer.set_congestion_control(CongestionControl::None);
+                    s.send_slice(&[b'x'; 2048]).unwrap();
+                    if fin_with_data {
+                        s.close();
+                    }
+
+                    for offset in [0, 1024] {
+                        recv(&mut s, Instant::ZERO, |repr| {
+                            let repr = repr.unwrap();
+                            assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                            assert_eq!(repr.payload.len(), 1024);
+                            assert!(
+                                send(
+                                    &mut peer,
+                                    Instant::ZERO,
+                                    &TcpRepr {
+                                        control: repr.control,
+                                        seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                                        ack_number: repr
+                                            .ack_number
+                                            .map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                                        window_len: repr.window_len,
+                                        payload: repr.payload,
+                                        ..SEND_TEMPL
+                                    }
+                                )
+                                .is_none()
+                            );
+                        });
+                    }
+
+                    if fin_after_ack {
+                        recv(&mut peer, Instant::from_millis(1), |repr| {
+                            let repr = repr.unwrap();
+                            assert_eq!(repr.window_len, 0);
+                            assert!(
+                                send(
+                                    &mut s,
+                                    Instant::from_millis(1),
+                                    &TcpRepr {
+                                        seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                                        ack_number: repr
+                                            .ack_number
+                                            .map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                                        window_len: repr.window_len,
+                                        ..SEND_TEMPL
+                                    }
+                                )
+                                .is_none()
+                            );
+                        });
+                        s.close();
+                        recv(&mut s, Instant::from_millis(2), |repr| {
+                            let repr = repr.unwrap();
+                            assert_eq!(repr.control, TcpControl::Fin);
+                            assert!(repr.payload.is_empty());
+                            send!(
+                                peer,
+                                time 2,
+                                TcpRepr {
+                                    control: TcpControl::Fin,
+                                    seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                                    ack_number: Some(LOCAL_SEQ + 1),
+                                    ..SEND_TEMPL
+                                }
+                            );
+                        });
+                    }
+
+                    if peer_reads {
+                        assert_eq!(peer.recv_slice(&mut [0; 2048]), Ok(2048));
+                    }
+                    // The peer received everything, but its final ACK is still in flight.
+                    recv(&mut peer, Instant::from_millis(3), |repr| {
+                        assert!(repr.unwrap().payload.is_empty());
+                    });
+                    if timeout {
+                        s.set_timeout(Some(Duration::from_millis(1)));
+                    } else {
+                        s.abort();
+                    }
+                    recv(&mut s, Instant::from_millis(4), |repr| {
+                        let repr = repr.unwrap();
+                        assert_eq!(repr.control, TcpControl::Rst);
+                        let expected = peer.remote_seq_no + peer.rx_buffer.len();
+                        assert_eq!(REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ), expected);
+                        let incoming = TcpRepr {
+                            control: repr.control,
+                            seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                            ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                            window_len: repr.window_len,
+                            ..SEND_TEMPL
+                        };
+                        assert!(send(&mut peer, Instant::from_millis(4), &incoming).is_none());
+                        assert_eq!(peer.state, State::Closed);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_reset_after_partial_retransmit_at_full_window() {
+        for timeout in [false, true] {
+            for deliver_ack in [false, true] {
+                let mut s = socket_established_with_buffer_sizes(8192, 64);
+                s.set_congestion_control(CongestionControl::Cubic);
+                s.remote_mss = 1024;
+                s.remote_win_len = 2048;
+                let mut peer = socket_established_with_buffer_sizes(64, 2048);
+                s.send_slice(&[b'x'; 2048]).unwrap();
+
+                for offset in [0, 1024] {
+                    recv(&mut s, Instant::ZERO, |repr| {
+                        let repr = repr.unwrap();
+                        assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                        assert_eq!(repr.payload.len(), 1024);
+                        if offset == 0 {
+                            send!(
+                                peer,
+                                TcpRepr {
+                                    seq_number: REMOTE_SEQ + 1,
+                                    ack_number: Some(LOCAL_SEQ + 1),
+                                    payload: repr.payload,
+                                    ..SEND_TEMPL
+                                }
+                            );
+                        }
+                    });
+                }
+                let mut ack = None;
+                recv(&mut peer, Instant::ZERO, |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1025));
+                    ack = Some(TcpRepr {
+                        seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                        ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                        window_len: repr.window_len,
+                        ..SEND_TEMPL
+                    });
+                });
+                // Lose the tail and the first RTO retransmission. The first ACK may also be lost.
+                recv(&mut s, Instant::from_millis(1000), |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                    assert_eq!(repr.payload.len(), 1024);
+                });
+                if deliver_ack {
+                    assert!(send(&mut s, Instant::from_millis(1001), &ack.unwrap()).is_none());
+                }
+                if timeout {
+                    s.set_timeout(Some(Duration::from_millis(1)));
+                } else {
+                    s.abort();
+                }
+                recv(&mut s, Instant::from_millis(1002), |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.control, TcpControl::Rst);
+                    let incoming = TcpRepr {
+                        control: repr.control,
+                        seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                        ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                        window_len: repr.window_len,
+                        ..SEND_TEMPL
+                    };
+                    assert!(send(&mut peer, Instant::from_millis(1002), &incoming).is_none());
+                    assert_eq!(peer.state, State::Closed);
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_reset_after_peer_retracts_window() {
+        for timeout in [false, true] {
+            for zero in [false, true] {
+                const RX: usize = 70_000;
+                const MSS: usize = 1001;
+                const SENT: usize = 2 * MSS;
+                const FILLED: usize = RX - SENT;
+                let mut s = socket_established_with_buffer_sizes(8192, 64);
+                s.set_congestion_control(CongestionControl::Cubic);
+                s.remote_mss = MSS;
+                s.remote_win_len = SENT;
+                s.remote_win_scale = Some(1);
+
+                let mut peer = socket_established_with_buffer_sizes(64, RX);
+                assert_eq!(peer.remote_win_shift, 1);
+                peer.remote_win_scale = Some(0);
+                peer.remote_seq_no = REMOTE_SEQ + 1 - FILLED;
+                assert_eq!(peer.rx_buffer.enqueue_slice(&vec![b'p'; FILLED]), FILLED);
+                peer.remote_last_ack = Some(REMOTE_SEQ + 1);
+                peer.remote_last_win = (SENT >> 1) as u16;
+                s.send_slice(&vec![b'x'; SENT]).unwrap();
+
+                let mut ack = None;
+                for offset in [0, MSS] {
+                    recv(&mut s, Instant::ZERO, |repr| {
+                        let repr = repr.unwrap();
+                        assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                        assert_eq!(repr.payload.len(), MSS);
+                        if offset == MSS && !zero {
+                            return;
+                        }
+                        // Both socket fixtures have the same endpoints and ISNs.
+                        assert!(
+                            send(
+                                &mut peer,
+                                Instant::ZERO,
+                                &TcpRepr {
+                                    control: repr.control,
+                                    seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                                    ack_number: repr
+                                        .ack_number
+                                        .map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                                    window_len: repr.window_len,
+                                    payload: repr.payload,
+                                    ..SEND_TEMPL
+                                }
+                            )
+                            .is_none()
+                        );
+                    });
+                    if offset == MSS && !zero {
+                        continue;
+                    }
+                    // Generate both peer ACKs to update its advertised right edge, but withhold
+                    // them from the sender until after the sender's partial RTO retransmission.
+                    recv(&mut peer, Instant::ZERO, |repr| {
+                        let repr = repr.unwrap();
+                        assert!(repr.payload.is_empty());
+                        ack = Some(TcpRepr {
+                            seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                            ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                            window_len: repr.window_len,
+                            ..SEND_TEMPL
+                        });
+                    });
+                }
+                assert_eq!(peer.recv_queue(), if zero { RX - 1 } else { FILLED + MSS });
+                assert_eq!(
+                    peer.remote_last_win,
+                    if zero { 0 } else { (MSS >> 1) as u16 }
+                );
+                assert_eq!(
+                    ack.as_ref().unwrap().ack_number,
+                    Some(LOCAL_SEQ + if zero { SENT } else { 1 + MSS })
+                );
+
+                // Drop the retransmission, then deliver the peer's retracted-window ACK.
+                recv(&mut s, Instant::from_millis(1000), |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                    assert_eq!(repr.payload.len(), MSS);
+                });
+                assert!(send(&mut s, Instant::from_millis(1001), &ack.unwrap()).is_none());
+                assert_eq!(
+                    s.local_seq_no,
+                    LOCAL_SEQ + if zero { SENT } else { 1 + MSS }
+                );
+                assert_eq!(s.remote_last_seq, s.local_seq_no);
+                if timeout {
+                    s.set_timeout(Some(Duration::from_millis(1)));
+                } else {
+                    s.abort();
+                    s.abort();
+                }
+                s.cx.set_now(Instant::from_millis(1002));
+                let TestSocket { socket, cx } = &mut s;
+                assert_eq!(
+                    socket.dispatch(cx, |_, _, (_, repr)| {
+                        assert_eq!(repr.control, TcpControl::Rst);
+                        Err::<(), ()>(())
+                    }),
+                    Err(())
+                );
+                recv(&mut s, Instant::from_millis(1002), |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.control, TcpControl::Rst);
+                    let incoming = TcpRepr {
+                        control: repr.control,
+                        seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                        ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                        window_len: repr.window_len,
+                        ..SEND_TEMPL
+                    };
+                    assert!(send(&mut peer, Instant::from_millis(1002), &incoming).is_none());
+                    assert_eq!(
+                        peer.state,
+                        State::Closed,
+                        "abort RST must close the peer after its window retracts"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_reset_after_scaled_window_retracts_with_lost_ack() {
+        for timeout in [false, true] {
+            const RX: usize = 262_144;
+            const WIN: usize = 2000;
+            const MSS: usize = 1001;
+            const SENT: usize = WIN - 1;
+            const FILLED: usize = RX - WIN;
+            let mut s = socket_established_with_buffer_sizes(8192, 64);
+            s.set_congestion_control(CongestionControl::Cubic);
+            s.congestion_controller.inner_mut().set_mss(MSS);
+            s.set_nagle_enabled(false);
+            s.remote_mss = MSS;
+            s.remote_win_len = WIN;
+            s.remote_win_scale = Some(3);
+
+            let mut peer = socket_established_with_buffer_sizes(64, RX);
+            assert_eq!(peer.remote_win_shift, 3);
+            peer.remote_win_scale = Some(0);
+            peer.remote_seq_no = REMOTE_SEQ + 1 - FILLED;
+            assert_eq!(peer.rx_buffer.enqueue_slice(&vec![b'p'; FILLED]), FILLED);
+            peer.remote_last_ack = Some(REMOTE_SEQ + 1);
+            peer.remote_last_win = (WIN >> 3) as u16;
+            s.send_slice(&vec![b'x'; SENT]).unwrap();
+
+            for offset in [0, MSS] {
+                recv(&mut s, Instant::ZERO, |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                    assert_eq!(
+                        repr.payload.len(),
+                        if offset == 0 { MSS } else { SENT - MSS }
+                    );
+                    if offset == 0 {
+                        let incoming = TcpRepr {
+                            control: repr.control,
+                            seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                            ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                            window_len: repr.window_len,
+                            payload: repr.payload,
+                            ..SEND_TEMPL
+                        };
+                        assert!(send(&mut peer, Instant::ZERO, &incoming).is_none());
+                    }
+                });
+            }
+            // Lose the ACK that retracts the peer's edge below our send frontier.
+            recv(&mut peer, Instant::from_millis(1), |repr| {
+                let repr = repr.unwrap();
+                assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1 + MSS));
+                assert_eq!(repr.window_len, 124);
+            });
+            // Lose the partial RTO retransmission too.
+            recv(&mut s, Instant::from_millis(1000), |repr| {
+                let repr = repr.unwrap();
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(repr.payload.len(), MSS);
+            });
+            assert_eq!(s.remote_win_len, WIN);
+            if timeout {
+                s.set_timeout(Some(Duration::from_millis(1)));
+            } else {
+                s.abort();
+            }
+            recv(&mut s, Instant::from_millis(1001), |repr| {
+                let repr = repr.unwrap();
+                assert_eq!(repr.control, TcpControl::Rst);
+                let incoming = TcpRepr {
+                    control: repr.control,
+                    seq_number: REMOTE_SEQ + (repr.seq_number - LOCAL_SEQ),
+                    ack_number: repr.ack_number.map(|a| LOCAL_SEQ + (a - REMOTE_SEQ)),
+                    window_len: repr.window_len,
+                    ..SEND_TEMPL
+                };
+                assert!(send(&mut peer, Instant::from_millis(1001), &incoming).is_none());
+                assert_eq!(peer.state, State::Closed);
+            });
+        }
+    }
+
+    #[test]
+    fn test_abort_after_syn_with_zero_window() {
+        let mut s = socket_syn_sent();
+        recv(&mut s, Instant::ZERO, |repr| {
+            assert_eq!(repr.unwrap().control, TcpControl::Syn);
+        });
+        assert_eq!(s.remote_win_len, 0);
+        s.abort();
+        recv(&mut s, Instant::from_millis(1), |repr| {
+            let repr = repr.unwrap();
+            assert_eq!(repr.control, TcpControl::Rst);
+            assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+        });
+    }
+
     #[cfg(feature = "socket-tcp-cubic")]
     fn socket_after_partial_retransmit(seq: TcpSeqNumber) -> TestSocket {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
@@ -6804,13 +7363,13 @@ mod test {
 
     #[test]
     #[cfg(feature = "socket-tcp-cubic")]
-    fn test_abort_after_retransmit_uses_send_frontier() {
+    fn test_abort_after_retransmit_preserves_cursor() {
         let mut s = socket_after_partial_retransmit(LOCAL_SEQ + 1);
         s.abort();
         recv(&mut s, Instant::from_millis(1001), |repr| {
             let repr = repr.unwrap();
             assert_eq!(repr.control, TcpControl::Rst);
-            assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + 2048);
+            assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + 1024);
         });
     }
 
@@ -7671,6 +8230,86 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + (6 * 4)),
             ..SEND_TEMPL
         });
+    }
+
+    #[test]
+    fn test_fast_retransmit_does_not_send_unsent_data() {
+        for closing in [false, true] {
+            let mut s = socket_established_with_buffer_sizes(4096, 64);
+            s.set_nagle_enabled(closing);
+            if closing {
+                s.send_slice(&[b'a'; 2040]).unwrap();
+                s.close();
+            }
+
+            // Small writes with Nagle off, or window-limited writes after close(),
+            // leave more than an MSS queued but only a few bytes in flight.
+            for i in 0..4usize {
+                if closing || i == 0 {
+                    send!(s, time i as i64, TcpRepr {
+                        seq_number: REMOTE_SEQ + 1,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        window_len: if closing { 10 * (i as u16 + 1) } else { 64 },
+                        ..SEND_TEMPL
+                    });
+                }
+                if !closing {
+                    s.send_slice(&[b'a'; 10]).unwrap();
+                }
+                recv(&mut s, Instant::from_millis(i as i64), |repr| {
+                    let repr = repr.unwrap();
+                    assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + 10 * i);
+                    assert_eq!(repr.payload.len(), 10);
+                });
+            }
+            if !closing {
+                s.send_slice(&[b'b'; 500]).unwrap();
+                recv(&mut s, Instant::from_millis(4), |repr| {
+                    assert_eq!(repr.unwrap().payload.len(), 24);
+                });
+            }
+            let sent = if closing { 40 } else { 64 };
+
+            // Lose the first segment; duplicate ACKs trigger fast retransmit.
+            for _ in 0..3 {
+                send!(s, time 5, TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    window_len: sent as u16,
+                    ..SEND_TEMPL
+                });
+            }
+            recv(&mut s, Instant::from_millis(5), |repr| {
+                let repr = repr.unwrap();
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(repr.payload.len(), sent);
+            });
+
+            // The peer accepts all in-flight data and closes its window.
+            send!(s, time 6, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + sent),
+                window_len: 0,
+                ..SEND_TEMPL
+            });
+            s.cx.set_now(Instant::from_millis(1500));
+            let TestSocket { socket, cx } = &mut s;
+            let _ = socket.dispatch(cx, |_, _, _| Ok::<(), ()>(()));
+
+            send!(s, time 2000, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + sent),
+                window_len: 0,
+                payload: b"xyz",
+                ..SEND_TEMPL
+            });
+            recv(&mut s, Instant::from_millis(2000), |repr| {
+                let repr = repr.unwrap();
+                assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 4));
+                assert!(repr.payload.is_empty());
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + sent);
+            });
+        }
     }
 
     #[test]
