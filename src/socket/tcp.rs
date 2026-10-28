@@ -8811,6 +8811,8 @@ mod test {
             cx: interface.inner,
             ..socket_listen()
         };
+        // Isolates oversized-frame accounting from the default congestion window.
+        s.set_congestion_control(CongestionControl::None);
         s.tx_buffer = SocketBuffer::new(vec![0; 2 * MAX_SEGMENTABLE_SIZE]);
 
         send!(
@@ -8885,6 +8887,34 @@ mod test {
                 }
             ]
         );
+    }
+
+    #[cfg(all(feature = "segmentation-offload", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn test_segmentation_offload_respects_cubic_window() {
+        let (interface, _, _) =
+            crate::tests::segmentation_offload::setup_segmenting(crate::phy::Medium::Ip);
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.cx = interface.inner;
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.remote_mss = 1024;
+        s.remote_win_len = 65535;
+        s.send_slice(&[b'x'; 8192]).unwrap();
+        let window = s.congestion_controller.inner().window();
+        assert!(window > s.remote_mss && window < s.send_queue());
+
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.dispatch(cx, |_, meta, (_, repr)| {
+                assert_eq!(meta.segmentation_offload_size.unwrap().get(), 1024);
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(repr.payload, &vec![b'x'; window]);
+                Ok::<(), ()>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(s.local_next_seq, LOCAL_SEQ + 1 + window);
+        recv_nothing!(s);
     }
 
     #[test]
@@ -9221,6 +9251,30 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn test_last_scaled_window_wraparound_and_exhaustion() {
+        for seq in [REMOTE_SEQ, TcpSeqNumber(i32::MAX - 16), TcpSeqNumber(-16)] {
+            for shift in [0, 3, 14] {
+                for advertised in [1, u16::MAX] {
+                    let window = (advertised as usize) << shift;
+                    for (received, remaining) in [
+                        (0, advertised),
+                        (window - (1 << shift), 1),
+                        (window, 0),
+                        (window + 1, 0),
+                    ] {
+                        let mut s = socket_established();
+                        s.remote_last_ack = Some(seq);
+                        s.remote_last_win = advertised;
+                        s.remote_win_shift = shift;
+                        s.remote_seq_no = seq + received;
+                        assert_eq!(s.last_scaled_window(), Some(remaining));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
