@@ -165,8 +165,7 @@ pub(crate) mod segmentation_offload {
 
     // The value is chosen to allow dispatching unsegmented packets whose sizes
     // exceed the length field in the IP header.
-    pub const MAX_SEGMENTABLE_SIZE: usize =
-        ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + (u16::MAX as usize) + 1;
+    pub const MAX_SEGMENTABLE_SIZE: usize = 70_000;
 
     pub fn setup_segmenting<'a>(
         medium: Medium,
