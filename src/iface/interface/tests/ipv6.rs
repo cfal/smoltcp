@@ -841,6 +841,47 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
     );
 }
 
+#[test]
+#[cfg(all(
+    feature = "proto-ipv6-slaac",
+    feature = "medium-ethernet",
+    feature = "socket-tcp"
+))]
+fn test_poll_at_after_slaac_solicitations_exhausted() {
+    use crate::socket::tcp;
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    iface.inner.slaac_enabled = true;
+    for millis in [0, 4000, 8000] {
+        iface.poll_egress(Instant::from_millis(millis), &mut device, &mut sockets);
+    }
+    let now = Instant::from_millis(8001);
+    assert_eq!(iface.inner.slaac.poll_at(now), None);
+    assert_eq!(iface.poll_at(now, &sockets), None);
+
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 1024]),
+        tcp::SocketBuffer::new(vec![0; 1024]),
+    );
+    let local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let remote = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    socket
+        .connect(iface.context(), (remote, 443), (local, 49152))
+        .unwrap();
+    let handle = sockets.add(socket);
+    assert_eq!(iface.poll_at(now, &sockets), Some(Instant::ZERO));
+    assert_eq!(iface.poll_delay(now, &sockets), Some(Duration::ZERO));
+
+    sockets.remove(handle);
+    iface.reset_slaac();
+    assert_eq!(iface.poll_at(now, &sockets), Some(Instant::ZERO));
+    iface.poll_egress(now, &mut device, &mut sockets);
+    assert_eq!(
+        iface.poll_at(now, &sockets),
+        Some(now + Duration::from_secs(4))
+    );
+}
+
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "proto-ipv6-slaac")]
