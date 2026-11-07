@@ -10213,28 +10213,36 @@ mod test {
 
     #[test]
     fn test_keep_alive_after_retransmit_uses_acknowledged_sequence() {
-        let mut s = socket_established();
-        s.set_keep_alive(Some(Duration::from_millis(100)));
-        s.send_slice(b"abcdef").unwrap();
-        recv!(s, time 0, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ + 1,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload: b"abcdef",
-            ..RECV_TEMPL
-        }));
+        for window in [0, 256] {
+            let mut s = socket_established();
+            s.set_keep_alive(Some(Duration::from_millis(100)));
+            s.send_slice(b"abcdef").unwrap();
+            recv!(s, time 0, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"abcdef",
+                ..RECV_TEMPL
+            }));
 
-        // An RTO rewound the cursor, but a closed window prevents retransmission.
-        s.remote_last_seq = s.local_seq_no + 1;
-        s.remote_win_len = 0;
-        s.timer = Timer::Idle {
-            keep_alive_at: Some(Instant::from_millis(100)),
-        };
-        recv!(s, time 100, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload: b"\x00",
-            ..RECV_TEMPL
-        }));
+            if window == 0 {
+                s.remote_last_seq = s.local_seq_no + 1;
+            }
+            s.remote_win_len = window;
+            let cursor = s.remote_last_seq;
+            let frontier = s.local_next_seq;
+            // Injects the timer state to isolate probe sequencing, not timer reachability.
+            s.timer = Timer::Idle {
+                keep_alive_at: Some(Instant::from_millis(100)),
+            };
+            recv!(s, time 100, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"\x00",
+                ..RECV_TEMPL
+            }));
+            assert_eq!(s.remote_last_seq, cursor);
+            assert_eq!(s.local_next_seq, frontier);
+        }
     }
 
     #[test]
