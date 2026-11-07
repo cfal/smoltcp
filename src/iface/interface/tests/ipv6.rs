@@ -872,10 +872,19 @@ fn test_poll_at_after_slaac_solicitations_exhausted() {
     assert_eq!(iface.poll_at(now, &sockets), Some(Instant::ZERO));
     assert_eq!(iface.poll_delay(now, &sockets), Some(Duration::ZERO));
 
-    sockets.remove(handle);
+    // Neighbor discovery delays the SYN while the SLAAC deadline changes.
+    iface.poll_egress(now, &mut device, &mut sockets);
+    let socket_at = now + Duration::from_secs(1);
+    assert_eq!(iface.poll_at(now, &sockets), Some(socket_at));
     iface.reset_slaac();
     assert_eq!(iface.poll_at(now, &sockets), Some(Instant::ZERO));
     iface.poll_egress(now, &mut device, &mut sockets);
+    assert_eq!(
+        iface.inner.slaac.poll_at(now),
+        Some(now + Duration::from_secs(4))
+    );
+    assert_eq!(iface.poll_at(now, &sockets), Some(socket_at));
+    sockets.remove(handle);
     assert_eq!(
         iface.poll_at(now, &sockets),
         Some(now + Duration::from_secs(4))
